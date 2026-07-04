@@ -1,9 +1,28 @@
-Start carla
+# CARLA Simulation Setup
 
-./CarlaUE4.sh -ResX=1280 -ResY=720 -RenderOffScreen
+## Install CARLA
 
-open seperate terminal
+Currently using [CARLA 0.9.14](https://carla.org/2022/12/23/release-0.9.14/).
 
-conda activate carla
+As that version seems to run the most stable on my PC.
 
-python3 <path-to-python-script>
+## Quick Start
+
+1. **Launch CARLA Server**:
+   Open a terminal and run:
+   ```bash
+   ./CarlaUE4.sh -ResX=1280 -ResY=720 -RenderOffScreen
+   ```
+
+
+ 2. **Activate Conda Environment**:
+    Open a separate terminal and activate the CARLA environment:
+    ```bash
+    conda activate carla
+    ```
+
+ 3. **Run Python Script**
+    Execute Python script:
+    ```bash
+    python3 <path-to-python-script>
+    ```
