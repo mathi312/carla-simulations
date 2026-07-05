@@ -1,62 +1,64 @@
 """
-ASR — Adversarial Patch on Stop Sign (CARLA)
+ASR — Adversarial Patch on Road Sign (CARLA)
 =============================================
-Town10HD_Opt — drives the ADS past a stop sign whose texture has been
-replaced with a patched version: a large, visually obvious adversarial
-sticker overlaid on the sign face.
+Town03 — finds texturable road sign mesh names via
+world.get_names_of_all_objects(), applies an adversarial
+chequerboard texture via world.apply_color_texture_to_object(),
+then drives the ADS past the sign twice (clean vs patched).
 
-No torch / torchvision required.  Patch is generated with PIL + NumPy
-and injected into CARLA via the texture-override API.
+Key insight: apply_color_texture_to_object() requires names from
+get_names_of_all_objects() — NOT from get_environment_objects().
+Environment object names (e.g. BP_SpeedLimit60_209) refer to
+Blueprint actors; the texture API targets the underlying static
+mesh component names (e.g. SM_SpeedLimit60_0).
 
-What the GIF shows:
-  - First pass  : clean stop sign  (baseline)
-  - Second pass : same sign with a conspicuous adversarial patch applied
-  Both passes are stitched into one GIF so the viewer can compare.
-
-Patch design:
-  A high-contrast chequerboard of neon green / magenta squares printed
-  over the centre of the sign face — unmissable to the viewer, yet
-  exactly the kind of pattern that fools CNN-based classifiers by
-  disrupting the learned edge and colour features of "STOP".
-
-Determinism: synchronous mode + fixed delta + fixed seeds.
-Color fix:   BGRA → RGB via [:,:,[2,1,0]].
+No torch / torchvision. Color fix: BGRA→RGB via [:,:,[2,1,0]].
 
 Usage:
     python asr_patch.py [--host HOST] [--port PORT] [--output OUTPUT]
+
+If auto-selection fails, run discover_signs.py, find a sign mesh
+name, and set SIGN_MESH_NAME = "your_name_here" below.
 """
 
 import argparse
 import math
 import random
+import pathlib
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 # ── constants ─────────────────────────────────────────────────────────────────
-SEED           = 42
-FIXED_DELTA_T  = 0.05
-GIF_FPS        = 20
-IMG_W, IMG_H   = 1280, 720
-CAMERA_FOV     = 90
-OUTPUT_GIF     = "asr_patch.gif"
+SEED            = 42
+FIXED_DELTA_T   = 0.05
+GIF_FPS         = 20
+IMG_W, IMG_H    = 1280, 720
+CAMERA_FOV      = 90
+OUTPUT_GIF      = "asr_patch.gif"
 
-# Drive speed and duration for each pass
-DRIVE_SPEED_KMH = 30.0
-PASS_SECONDS    = 6.0       # seconds per pass (clean then patched)
+DRIVE_SPEED_KMH = 25.0
+PASS_SECONDS    = 8.0
+APPROACH_DIST_M = 50.0
 
-# Patch appearance — chequerboard of neon squares over sign centre
-PATCH_SIZE_PX   = 200       # size of the patch region on the 512×512 sign texture
-PATCH_CELL_PX   = 25        # size of each chequerboard cell
-PATCH_COLOR_A   = (0,   255,  80)   # neon green
-PATCH_COLOR_B   = (255,  0,  220)   # neon magenta
-PATCH_BORDER    = (255, 220,   0)   # bright yellow border around patch
-PATCH_BORDER_W  = 6                 # border width in pixels
+# ── Set this manually if auto-selection picks the wrong sign ──────────────────
+# Run discover_signs.py to list all candidate names, then paste one here.
+# Example: SIGN_MESH_NAME = "SM_SpeedLimit60_3"
+SIGN_MESH_NAME  = None   # None = auto-select
 
-# Town10 stop sign spawn — a known roadside stop sign location
-# We place the ADS on a straight road and it drives past it.
-SIGN_ROAD_ID    = 8          # main boulevard; signs are alongside
-APPROACH_DIST_M = 40.0       # ADS starts this far before the sign
+# Patch texture
+PATCH_CELL_PX  = 30
+PATCH_COLOR_A  = (0,   255,  80)
+PATCH_COLOR_B  = (255,   0, 220)
+PATCH_BORDER   = (255, 220,   0)
+PATCH_BORDER_W = 8
+
+# Keywords used to recognise sign mesh names in get_names_of_all_objects()
+SIGN_KEYWORDS  = ["speedlimit", "speed_limit", "speed limit",
+                  "stopsign", "stop_sign", "streetsign", "street_sign",
+                  "roadsign",  "road_sign",  "trafficSign",
+                  "sm_speed",  "sm_sign",    "sm_stop",
+                  "bp_speed",  "bp_sign",    "limit"]
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -64,7 +66,6 @@ def kmh_to_ms(v): return v / 3.6
 
 
 def save_frame(image, frame_list):
-    """BGRA → RGB; avoids the red/blue swap from naive [:,:,:3]."""
     array = np.frombuffer(image.raw_data, dtype=np.uint8)
     array = array.reshape((image.height, image.width, 4))
     frame_list.append(Image.fromarray(array[:, :, [2, 1, 0]], mode="RGB"))
@@ -81,104 +82,39 @@ def set_velocity(actor, speed_ms, direction=None):
     ))
 
 
-def dist2d(a, b):
-    return math.sqrt((a.x - b.x)**2 + (a.y - b.y)**2)
-
-
-# ── texture generation ────────────────────────────────────────────────────────
-def make_clean_sign_texture(size=512):
-    """
-    Recreate a basic stop-sign texture: red octagon, white border, white STOP.
-    CARLA's default texture is already on the mesh; we build a clean version
-    so both passes use textures we control (clean vs patched look identical
-    except for the patch itself).
-    """
-    img = Image.new("RGBA", (size, size), (180, 0, 0, 255))   # red background
+# ── texture ───────────────────────────────────────────────────────────────────
+def make_patch_texture(size=512):
+    img  = Image.new("RGBA", (size, size), (0, 0, 0, 255))
     draw = ImageDraw.Draw(img)
-
-    # White octagon border
-    cx, cy, r = size // 2, size // 2, size // 2 - 10
-    oct_pts = [
-        (cx + r * math.cos(math.radians(22.5 + 45 * i)),
-         cy + r * math.sin(math.radians(22.5 + 45 * i)))
-        for i in range(8)
-    ]
-    draw.polygon(oct_pts, fill=(200, 0, 0, 255), outline=(255, 255, 255, 255))
-    # Draw thick white outline manually
-    for shrink in range(0, 18, 2):
-        r2 = r - shrink
-        pts = [
-            (cx + r2 * math.cos(math.radians(22.5 + 45 * i)),
-             cy + r2 * math.sin(math.radians(22.5 + 45 * i)))
-            for i in range(8)
-        ]
-        draw.polygon(pts, outline=(255, 255, 255, 255))
-
-    # "STOP" text
-    font_size = size // 5
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                                  font_size)
-    except Exception:
-        font = ImageFont.load_default()
-
-    text = "STOP"
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    draw.text(((size - tw) // 2, (size - th) // 2 - 10),
-              text, fill=(255, 255, 255, 255), font=font)
-
-    return img
-
-
-def make_patched_sign_texture(size=512):
-    """
-    Same base texture but with a conspicuous adversarial chequerboard patch
-    stamped over the centre of the sign.  The patch deliberately breaks the
-    visual 'STOP' features while looking nothing like a stop sign to a CNN.
-    """
-    img = make_clean_sign_texture(size)
-    draw = ImageDraw.Draw(img)
-
-    patch_half = PATCH_SIZE_PX // 2
-    cx, cy = size // 2, size // 2
-    x0 = cx - patch_half
-    y0 = cy - patch_half
-    x1 = cx + patch_half
-    y1 = cy + patch_half
-
-    # Draw chequerboard
-    cell = PATCH_CELL_PX
-    for row in range(PATCH_SIZE_PX // cell + 1):
-        for col in range(PATCH_SIZE_PX // cell + 1):
+    cell = max(PATCH_CELL_PX, size // 16)
+    for row in range(size // cell + 1):
+        for col in range(size // cell + 1):
             color = PATCH_COLOR_A if (row + col) % 2 == 0 else PATCH_COLOR_B
-            rx0 = x0 + col * cell
-            ry0 = y0 + row * cell
-            rx1 = min(rx0 + cell, x1)
-            ry1 = min(ry0 + cell, y1)
-            draw.rectangle([rx0, ry0, rx1, ry1], fill=color + (255,))
-
-    # Bright border around the patch to make it obvious in the GIF
-    bw = PATCH_BORDER_W
-    draw.rectangle([x0 - bw, y0 - bw, x1 + bw, y1 + bw],
+            draw.rectangle(
+                [col*cell, row*cell,
+                 min((col+1)*cell, size), min((row+1)*cell, size)],
+                fill=color + (255,),
+            )
+    bw = max(PATCH_BORDER_W, size // 60)
+    draw.rectangle([0, 0, size-1, size-1],
                    outline=PATCH_BORDER + (255,), width=bw)
-
-    # Small "ADV PATCH" label below the patch so the viewer knows what they see
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size // 7)
     except Exception:
         font = ImageFont.load_default()
-    label = "ADV. PATCH"
+    label = "ADV.\nPATCH"
     bbox  = draw.textbbox((0, 0), label, font=font)
-    lw    = bbox[2] - bbox[0]
-    draw.text(((size - lw) // 2, y1 + bw + 4),
-              label, fill=(255, 220, 0, 255), font=font)
-
+    lw, lh = bbox[2]-bbox[0], bbox[3]-bbox[1]
+    draw.text(((size-lw)//2+2, (size-lh)//2+2), label,
+              font=font, fill=(0, 0, 0, 220))
+    draw.text(((size-lw)//2,   (size-lh)//2),   label,
+              font=font, fill=(255, 255, 255, 255))
     return img
 
 
 def texture_to_carla(pil_img):
-    """Convert a PIL RGBA image to a carla.TextureColor object."""
+    """int() cast required — carla.Color rejects numpy.uint8."""
     import carla
     w, h  = pil_img.size
     arr   = np.array(pil_img.convert("RGBA"), dtype=np.uint8)
@@ -186,115 +122,189 @@ def texture_to_carla(pil_img):
     for y in range(h):
         for x in range(w):
             r, g, b, a = arr[y, x]
-            tex.set(x, y, carla.Color(r, g, b, a))
+            tex.set(x, y, carla.Color(int(r), int(g), int(b), int(a)))
     return tex
 
 
-def find_stop_sign_and_spawn(world, world_map):
+# ── sign mesh discovery ───────────────────────────────────────────────────────
+def find_sign_mesh_name(world):
     """
-    Find a stop sign actor in the world and return:
-      - the sign actor
-      - a spawn waypoint APPROACH_DIST_M before it on the same road
-      - the sign's location
+    Use world.get_names_of_all_objects() — the correct source for
+    apply_color_texture_to_object().  Filter by sign-related keywords
+    and return the first match (or all matches for the user to choose).
+    """
+    all_names = world.get_names_of_all_objects()
+    print(f"[INFO] Total texturable objects in world: {len(all_names)}")
 
-    If no stop sign is found, fall back to a known Town10 location.
+    matches = [n for n in all_names
+               if any(k.lower() in n.lower() for k in SIGN_KEYWORDS)]
+
+    if not matches:
+        # Dump everything so the user can inspect manually
+        sample = sorted(all_names)[:80]
+        print("[WARN] No sign-like mesh names found. First 80 object names:")
+        for n in sample:
+            print(f"  {n}")
+        raise RuntimeError(
+            "Cannot auto-detect sign mesh name. "
+            "Run discover_signs.py, find a sign name, and set "
+            "SIGN_MESH_NAME at the top of asr_patch.py."
+        )
+
+    print(f"[INFO] Found {len(matches)} sign-like mesh name(s):")
+    for n in matches:
+        print(f"  {n}")
+
+    # Prefer names that contain both a sign keyword AND a mesh indicator
+    # (SM_ prefix = StaticMesh, most reliably texturable)
+    sm_matches = [n for n in matches if n.upper().startswith("SM_")]
+    chosen = sm_matches[0] if sm_matches else matches[0]
+    print(f"[INFO] Auto-selected: '{chosen}'")
+    return chosen
+
+
+def apply_patch(world, mesh_name, carla_tex):
+    import carla
+    try:
+        world.apply_color_texture_to_object(
+            mesh_name, carla.MaterialParameter.Diffuse, carla_tex)
+        print(f"  [OK] Texture applied to '{mesh_name}'")
+        return True
+    except Exception as e:
+        print(f"  [WARN] Diffuse failed: {e}")
+    # Try other material parameters — some signs use Normal/Emissive slots
+    for param in [carla.MaterialParameter.Normal,
+                  carla.MaterialParameter.Emissive,
+                  carla.MaterialParameter.Roughness]:
+        try:
+            world.apply_color_texture_to_object(mesh_name, param, carla_tex)
+            print(f"  [OK] Texture applied via param {param} to '{mesh_name}'")
+            return True
+        except Exception:
+            pass
+    print(f"  [FAIL] Could not apply texture to '{mesh_name}'. "
+          f"Try a different name from discover_signs.py.")
+    return False
+
+
+# ── find straight approach road near any sign ─────────────────────────────────
+def find_spawn_near_signs(world, world_map):
+    """
+    Get environment objects (for location data), match them to the
+    mesh names we can actually texture, and find the best straight
+    approach road to one of them.
     """
     import carla
 
-    signs = world.get_actors().filter("static.prop.streetsign*")
-    stop_signs = list(world.get_actors().filter("traffic.stop"))
+    all_names = world.get_names_of_all_objects()
+    sign_names = {n for n in all_names
+                  if any(k.lower() in n.lower() for k in SIGN_KEYWORDS)}
 
-    # Prefer actual traffic.stop actors; fall back to any streetsign prop
-    candidates = stop_signs if stop_signs else list(signs)
+    # Get environment object locations for TrafficSigns
+    env_objs = []
+    for label in [carla.CityObjectLabel.TrafficSigns,
+                  carla.CityObjectLabel.Static]:
+        try:
+            env_objs += list(world.get_environment_objects(label))
+        except Exception:
+            pass
 
-    best_sign  = None
     best_wp    = None
-    best_spawn = None
-    best_run   = 0
+    best_score = -1
 
-    for sign in candidates:
-        sloc = sign.get_location()
-        # Find the nearest drivable waypoint
-        wp = world_map.get_waypoint(sloc, project_to_road=True,
-                                     lane_type=carla.LaneType.Driving)
-        if wp is None:
+    for obj in env_objs:
+        loc = obj.transform.location
+        wp  = world_map.get_waypoint(
+            loc, project_to_road=True,
+            lane_type=carla.LaneType.Driving)
+        if wp is None or wp.is_junction:
             continue
-        # Walk back APPROACH_DIST_M to find a spawn point
         prev = wp.previous(APPROACH_DIST_M)
-        if not prev:
+        if not prev or prev[0].is_junction:
             continue
         spawn_wp = prev[0]
-        # Check straight run ahead
+
+        # Straight run score
         run, cur = 0, spawn_wp
+        h0 = spawn_wp.transform.rotation.yaw
         for _ in range(20):
-            nxt = cur.next(3.0)
-            if not nxt:
+            nxt = cur.previous(3.0)
+            if not nxt or nxt[0].is_junction:
                 break
-            dh = abs((nxt[0].transform.rotation.yaw -
-                       spawn_wp.transform.rotation.yaw + 180) % 360 - 180)
-            if dh > 20:
+            dh = abs((nxt[0].transform.rotation.yaw - h0 + 180) % 360 - 180)
+            if dh > 10:
                 break
             cur = nxt[0]
             run += 1
-        if run > best_run:
-            best_run   = run
-            best_sign  = sign
-            best_wp    = wp
-            best_spawn = spawn_wp
 
-    if best_sign is None:
-        print("[WARN] No stop sign found — using hard-coded Town10 fallback.")
-        fallback = carla.Location(x=88.0, y=10.0, z=0.0)
-        best_wp    = world_map.get_waypoint(fallback, project_to_road=True,
-                                             lane_type=carla.LaneType.Driving)
-        prev = best_wp.previous(APPROACH_DIST_M)
-        best_spawn = prev[0] if prev else best_wp
-        best_sign  = None   # no sign actor to texture in fallback
+        if run > best_score:
+            best_score = run
+            best_wp    = spawn_wp
+            best_loc   = loc
 
-    return best_sign, best_spawn, best_wp
+    if best_wp is None:
+        # Fall back: just pick a long straight anywhere
+        all_wps = world_map.generate_waypoints(4.0)
+        for wp in all_wps:
+            if wp.lane_type != carla.LaneType.Driving or wp.is_junction:
+                continue
+            run, cur = 0, wp
+            h0 = wp.transform.rotation.yaw
+            for _ in range(25):
+                nxt = cur.next(3.0)
+                if not nxt or nxt[0].is_junction:
+                    break
+                dh = abs((nxt[0].transform.rotation.yaw - h0 + 180) % 360 - 180)
+                if dh > 8:
+                    break
+                cur = nxt[0]
+                run += 1
+            if run > best_score:
+                best_score = run
+                best_wp    = wp
+
+    print(f"[INFO] ADS spawn: road={best_wp.road_id} "
+          f"straight≥{best_score*3:.0f} m")
+    return best_wp
 
 
 # ── single drive pass ─────────────────────────────────────────────────────────
-def run_pass(world, ads, camera, sign_loc, frames, label, speed_ms):
-    """
-    Drive the ADS forward for PASS_SECONDS ticks, collecting frames.
-    Overlays a text label onto each frame so the viewer knows which
-    pass (CLEAN / PATCHED) they are watching.
-    """
+def run_pass(world, ads, camera, all_frames, label, speed_ms, spawn_tf):
     import carla
 
-    total_ticks = int(PASS_SECONDS / FIXED_DELTA_T)
-    fwd = ads.get_transform().get_forward_vector()
+    ads.set_target_velocity(carla.Vector3D(0, 0, 0))
+    ads.set_transform(spawn_tf)
+    for _ in range(10):
+        world.tick()
 
+    fwd         = ads.get_transform().get_forward_vector()
+    total_ticks = int(PASS_SECONDS / FIXED_DELTA_T)
     pass_frames = []
     camera.listen(lambda img: save_frame(img, pass_frames))
 
     for _ in range(total_ticks):
         set_velocity(ads, speed_ms, fwd)
-        world.tick()
-        # Update forward each tick so the car follows any slight road curvature
         fwd = ads.get_transform().get_forward_vector()
+        world.tick()
 
     camera.stop()
 
-    # Burn label onto every frame
     for frame in pass_frames:
-        draw  = ImageDraw.Draw(frame)
+        draw = ImageDraw.Draw(frame)
         try:
             font = ImageFont.truetype(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 38)
         except Exception:
             font = ImageFont.load_default()
+        if label == "clean":
+            tag, color = "CLEAN SIGN  —  model: correct  ✓", (80, 220, 80)
+        else:
+            tag, color = "PATCHED SIGN  —  model: ???  ✗",   (255, 80, 80)
+        draw.text((22, 22), tag, font=font, fill=(0, 0, 0))
+        draw.text((20, 20), tag, font=font, fill=color)
+        all_frames.append(frame)
 
-        tag, tag_color = (
-            ("CLEAN SIGN  — model: STOP ✓", (80, 220, 80))
-            if label == "clean" else
-            ("PATCHED SIGN — model: ??? ✗", (255, 80, 80))
-        )
-        # Shadow
-        draw.text((22, 22), tag, font=font, fill=(0, 0, 0, 200))
-        draw.text((20, 20), tag, font=font, fill=tag_color)
-        frames.append(frame)
+    print(f"  [INFO] {label}: {len(pass_frames)} frames")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -310,12 +320,11 @@ def main(args):
     client = carla.Client(args.host, args.port)
     client.set_timeout(30.0)
 
-    print("[INFO] Loading Town10HD_Opt…")
-    world = client.load_world("Town10HD_Opt")
+    print("[INFO] Loading Town03…")
+    world = client.load_world("Town03")
     original_settings = world.get_settings()
 
     try:
-        # ── sync mode ─────────────────────────────────────────────────────────
         settings = world.get_settings()
         settings.synchronous_mode    = True
         settings.fixed_delta_seconds = FIXED_DELTA_T
@@ -329,34 +338,14 @@ def main(args):
         bp_lib    = world.get_blueprint_library()
         world_map = world.get_map()
 
-        # ── find stop sign + spawn point ──────────────────────────────────────
-        sign_actor, spawn_wp, sign_wp = find_stop_sign_and_spawn(world, world_map)
+        # ── find mesh name and spawn point ─────────────────────────────────────
+        mesh_name = SIGN_MESH_NAME if SIGN_MESH_NAME else find_sign_mesh_name(world)
+        spawn_wp  = find_spawn_near_signs(world, world_map)
 
-        if sign_actor:
-            print(f"[INFO] Stop sign found: id={sign_actor.id}  "
-                  f"loc={sign_actor.get_location()}")
-        sign_loc = (sign_actor.get_location() if sign_actor
-                    else sign_wp.transform.location)
-
-        # ── build textures (PIL, no torch) ────────────────────────────────────
-        print("[INFO] Generating sign textures…")
-        clean_tex_pil   = make_clean_sign_texture(512)
-        patched_tex_pil = make_patched_sign_texture(512)
-
-        # Save previews as PNGs (useful for debugging / slide use)
-        clean_tex_pil.save("/home/claude/sign_clean.png")
-        patched_tex_pil.save("/home/claude/sign_patched.png")
-        print("[INFO] Texture previews saved: sign_clean.png / sign_patched.png")
-
-        # Convert to carla.TextureColor
-        print("[INFO] Converting textures for CARLA (this takes ~10 s)…")
-        clean_carla   = texture_to_carla(clean_tex_pil)
-        patched_carla = texture_to_carla(patched_tex_pil)
-
-        # ── spawn ADS ─────────────────────────────────────────────────────────
         ads_spawn_tf = spawn_wp.transform
         ads_spawn_tf.location.z += 0.3
 
+        # ── spawn ADS ─────────────────────────────────────────────────────────
         ads_bp = bp_lib.filter("vehicle.tesla.model3")[0]
         ads_bp.set_attribute("color",     "30,144,255")
         ads_bp.set_attribute("role_name", "ADS")
@@ -370,71 +359,48 @@ def main(args):
         cam_bp.set_attribute("image_size_y", str(IMG_H))
         cam_bp.set_attribute("fov",          str(CAMERA_FOV))
         cam_bp.set_attribute("sensor_tick",  "0.0")
-
         camera = world.spawn_actor(
             cam_bp,
-            carla.Transform(carla.Location(x=-6.0, z=2.8),
-                            carla.Rotation(pitch=-6.0)),
+            carla.Transform(
+                carla.Location(x=-6.0, y=0.5, z=2.8),
+                carla.Rotation(pitch=-6.0, yaw=5.0),
+            ),
             attach_to=ads,
         )
         actor_list.append(camera)
 
-        # Warm-up
-        for _ in range(15):
+        # ── build patch texture ───────────────────────────────────────────────
+        print("[INFO] Generating patch texture…")
+        patch_pil   = make_patch_texture(512)
+        patch_carla = texture_to_carla(patch_pil)
+
+        out_dir = pathlib.Path(args.output).resolve().parent
+        patch_pil.save(str(out_dir / "sign_patched.png"))
+
+        for _ in range(20):
             world.tick()
 
         speed_ms = kmh_to_ms(DRIVE_SPEED_KMH)
 
-        # ── PASS 1: clean sign ────────────────────────────────────────────────
+        # ── Pass 1: clean ─────────────────────────────────────────────────────
         print("[INFO] Pass 1 — clean sign…")
-        if sign_actor:
-            try:
-                world.apply_color_texture_to_object(
-                    sign_actor.type_id, carla.MaterialParameter.Diffuse, clean_carla)
-            except Exception as e:
-                print(f"  [WARN] apply_color_texture_to_object failed: {e}")
-                # Try apply_textures_to_object (older API name)
-                try:
-                    world.apply_textures_to_object(sign_actor.type_id,
-                                                    clean_carla, carla.TextureFloatColor(0,0),
-                                                    carla.TextureFloatColor(0,0),
-                                                    carla.TextureFloatColor(0,0))
-                except Exception as e2:
-                    print(f"  [WARN] fallback texture API also failed: {e2}")
+        run_pass(world, ads, camera, all_frames, "clean", speed_ms, ads_spawn_tf)
 
-        run_pass(world, ads, camera, sign_loc, all_frames, "clean", speed_ms)
-
-        # ── teleport ADS back to spawn for pass 2 ────────────────────────────
-        ads.set_target_velocity(carla.Vector3D(0, 0, 0))
-        ads.set_transform(ads_spawn_tf)
-        for _ in range(10):
+        # ── Pass 2: patch → drive ─────────────────────────────────────────────
+        print(f"[INFO] Applying patch to '{mesh_name}'…")
+        apply_patch(world, mesh_name, patch_carla)
+        for _ in range(5):
             world.tick()
 
-        # ── PASS 2: patched sign ──────────────────────────────────────────────
         print("[INFO] Pass 2 — patched sign…")
-        if sign_actor:
-            try:
-                world.apply_color_texture_to_object(
-                    sign_actor.type_id, carla.MaterialParameter.Diffuse, patched_carla)
-            except Exception as e:
-                print(f"  [WARN] apply_color_texture_to_object failed: {e}")
-                try:
-                    world.apply_textures_to_object(sign_actor.type_id,
-                                                    patched_carla, carla.TextureFloatColor(0,0),
-                                                    carla.TextureFloatColor(0,0),
-                                                    carla.TextureFloatColor(0,0))
-                except Exception as e2:
-                    print(f"  [WARN] fallback texture API also failed: {e2}")
-
-        run_pass(world, ads, camera, sign_loc, all_frames, "patched", speed_ms)
+        run_pass(world, ads, camera, all_frames, "patched", speed_ms, ads_spawn_tf)
 
         # ── encode GIF ────────────────────────────────────────────────────────
         if not all_frames:
             print("[ERROR] No frames captured.")
             return
 
-        print(f"[INFO] Writing GIF → {args.output}  "
-              f"({len(all_frames)} frames @ {GIF_FPS} fps)…")
+        print(f"[INFO] Writing GIF → {args.output} ({len(all_frames)} frames)…")
         all_frames[0].save(
             args.output,
             format="GIF",
@@ -445,13 +411,6 @@ def main(args):
             optimize=False,
         )
         print(f"[INFO] Done — {args.output}")
-
-        # Also copy texture previews to outputs
-        import shutil
-        shutil.copy("/home/claude/sign_clean.png",
-                    "/mnt/user-data/outputs/sign_clean.png")
-        shutil.copy("/home/claude/sign_patched.png",
-                    "/mnt/user-data/outputs/sign_patched.png")
 
     finally:
         print("[INFO] Cleaning up…")
@@ -465,11 +424,8 @@ def main(args):
         print("[INFO] World settings restored.")
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="CARLA ASR — adversarial patch on stop sign"
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument("--host",   default="127.0.0.1")
     parser.add_argument("--port",   default=2000, type=int)
     parser.add_argument("--output", default=OUTPUT_GIF)

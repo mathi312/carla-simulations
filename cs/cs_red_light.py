@@ -37,7 +37,7 @@ FIXED_DELTA_T     = 0.05          # s per tick  (20 fps physics)
 GIF_FPS           = 20
 RECORD_SECONDS    = 10.0
 
-ADS_SPEED_KMH     = 50.0          # cruise speed approaching intersection
+ADS_SPEED_KMH     = 45.0          # cruise speed approaching intersection
 ADS_BRAKE_DECEL   = 8.0           # m/s²  maximum emergency braking
 OTHER_SPEED_KMH   = 45.0          # red-light runner approach speed
 
