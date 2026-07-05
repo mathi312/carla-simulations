@@ -17,6 +17,7 @@ import argparse
 import math
 import random
 import time
+import carla
 
 import numpy as np
 from PIL import Image
@@ -26,6 +27,7 @@ SEED              = 42
 FIXED_DELTA_T     = 0.05          # s per tick (20 fps)
 GIF_FPS           = 20
 RECORD_SECONDS    = 15.0          # Longer duration to capture approach, wait, and turn
+TRAFFIC_DENSITY   = 200           # Number of background vehicles around the intersection
 
 IMG_W, IMG_H      = 1280, 720
 CAMERA_FOV        = 90
@@ -41,6 +43,95 @@ def save_frame(image, frame_list):
 
 def dist2d(a, b):
     return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+
+
+def find_traffic_light_for_waypoint(world, waypoint):
+    """Return the traffic light associated with the given waypoint, if present."""
+    traffic_lights = world.get_actors().filter("traffic.traffic_light")
+    for traffic_light in traffic_lights:
+        for stop_wp in traffic_light.get_stop_waypoints():
+            if stop_wp and dist2d(stop_wp.transform.location, waypoint.transform.location) < 8.0:
+                return traffic_light
+    return None
+
+
+def try_spawn_actor_with_fallback(world, blueprint, transform, max_attempts=6):
+    """Try a few nearby spawn transforms to avoid failures from blocked spawn points."""
+    offsets = [0.0, 2.0, -2.0, 4.0, -4.0, 6.0]
+    for offset in offsets[:max_attempts]:
+        candidate = carla.Transform(
+            carla.Location(
+                x=transform.location.x + offset,
+                y=transform.location.y,
+                z=transform.location.z + 0.3,
+            ),
+            transform.rotation,
+        )
+        actor = world.try_spawn_actor(blueprint, candidate)
+        if actor is not None:
+            return actor
+    raise RuntimeError(f"Failed to spawn {blueprint.id} after {max_attempts} attempts")
+
+
+def spawn_intersection_traffic(world, tm, bp_lib, junction, actor_list, reference_location, max_vehicles=4):
+    """Spawn extra traffic from the requested Town03 entry points while leaving the ADS path unchanged."""
+    spawned = 0
+    spawn_points = world.get_map().get_spawn_points()
+    preferred_indices = [10, 11, 60]
+
+    def try_spawn_from_waypoint(wp, lane_offset=0.0, speed=30.0):
+        nonlocal spawned
+        if spawned >= max_vehicles:
+            return
+        candidate_tf = wp.transform
+        forward = candidate_tf.get_forward_vector()
+        right = carla.Vector3D(x=-forward.y, y=forward.x, z=0.0)
+        candidate_tf.location.x += right.x * lane_offset
+        candidate_tf.location.y += right.y * lane_offset
+        candidate_tf.location.z += 0.3
+        bg_bp = random.choice(bp_lib.filter("vehicle.*.*"))
+        if bg_bp.get_attribute("number_of_wheels").as_int() != 4:
+            return
+        try:
+            bg_veh = world.try_spawn_actor(bg_bp, candidate_tf)
+        except Exception:
+            bg_veh = None
+        if bg_veh:
+            actor_list.append(bg_veh)
+            bg_veh.set_simulate_physics(True)
+            bg_veh.set_autopilot(True, tm.get_port())
+            tm.set_desired_speed(bg_veh, speed)
+            spawned += 1
+
+    for idx in preferred_indices:
+        if spawned >= max_vehicles:
+            break
+        if not 0 <= idx < len(spawn_points):
+            continue
+        sp = spawn_points[idx]
+        wp = world.get_map().get_waypoint(sp.location)
+        if not wp:
+            continue
+        for offset in [-3.0, 0.0, 3.0]:
+            if spawned >= max_vehicles:
+                break
+            try_spawn_from_waypoint(wp, lane_offset=offset, speed=random.uniform(22.0, 38.0))
+
+    # Fall back to the existing junction-side sampling if needed.
+    if spawned < max_vehicles:
+        junction_wps = junction.get_waypoints(carla.LaneType.Driving)
+        for lane_wps in junction_wps:
+            if spawned >= max_vehicles:
+                break
+            entry_wp = lane_wps[0]
+            if dist2d(entry_wp.transform.location, reference_location) < 25.0:
+                continue
+            prev_wps = entry_wp.previous(20.0)
+            if not prev_wps:
+                continue
+            try_spawn_from_waypoint(prev_wps[0], lane_offset=random.choice([-3.0, 3.0]), speed=random.uniform(22.0, 38.0))
+
+    return spawned
 
 
 def find_complex_intersection(world_map):
@@ -70,7 +161,6 @@ def find_complex_intersection(world_map):
 
 # ── main ──────────────────────────────────────────────────────────────────────
 def main(args):
-    import carla
 
     random.seed(SEED)
     np.random.seed(SEED)
@@ -112,48 +202,37 @@ def main(args):
         ads_bp.set_attribute("color", "30,144,255")  # Blue
         ads_bp.set_attribute("role_name", "ADS")
         
-        # Move back roughly 45 meters from the junction entry to simulate the approach phase
-        ads_spawn_wp = ads_approach_wp.previous(45.0)[0]
-        ads = world.spawn_actor(ads_bp, ads_spawn_wp.transform)
+        traffic_light = find_traffic_light_for_waypoint(world, ads_approach_wp)
+        ads_spawn_wp = ads_approach_wp
+        if traffic_light:
+            stop_waypoints = traffic_light.get_stop_waypoints()
+            if stop_waypoints:
+                stop_wp = min(stop_waypoints, key=lambda wp: dist2d(wp.transform.location, ads_approach_wp.transform.location))
+                prev_wps = stop_wp.previous(6.0)
+                if prev_wps:
+                    ads_spawn_wp = prev_wps[0]
+
+        ads_spawn_tf = ads_spawn_wp.transform
+        ads_spawn_tf.location.z += 0.3
+
+        ads = try_spawn_actor_with_fallback(world, ads_bp, ads_spawn_tf)
         actor_list.append(ads)
         
-        # Configure Traffic Manager autopilot behavior for ADS
         ads.set_simulate_physics(True)
         ads.set_autopilot(True, tm.get_port())
-        
-        # Force a left turn at the intersection to create a right-of-way conflict
-        # TM handles choices via down-road waypoint intentions
-        next_choices = ads_approach_wp.next(10.0)
-        # Filter choices to select a path turning left across oncoming traffic
-        tm.set_route(ads, ["Left"]) 
         tm.set_desired_speed(ads, 35.0)  # Safe city approach speed in km/h
+        tm.set_route(ads, ["Left"])
 
         # ── Spawn Oncoming and Ambient Vehicles ──────────────────────────────
-        # We find lanes within the intersection that are opposing the ADS direction
-        spawned_ambient = 0
-        for j_wp in junction_wps:
-            # Entry points to the junction
-            entry_wp = j_wp[0]
-            # Avoid placing directly on top of the ADS approach lane
-            if dist2d(entry_wp.transform.location, ads_spawn_wp.transform.location) > 20.0:
-                if spawned_ambient >= 3: # Limit density to avoid total deadlock gridlocks
-                    break
-                    
-                # Walk backwards along the other legs of the intersection to place ambient traffic
-                bg_wps = entry_wp.previous(20.0)
-                if bg_wps:
-                    bg_bp = random.choice(bp_lib.filter("vehicle.*.*"))
-                    # Don't pick bikes/trucks for stability here
-                    if bg_bp.get_attribute("number_of_wheels").as_int() == 4:
-                        bg_veh = world.try_spawn_actor(bg_bp, bg_wps[0].transform)
-                        if bg_veh:
-                            actor_list.append(bg_veh)
-                            bg_veh.set_simulate_physics(True)
-                            bg_veh.set_autopilot(True, tm.get_port())
-                            # Make oncoming traffic aggressive enough to challenge the ADS gap choices
-                            tm.set_desired_speed(bg_veh, 40.0)
-                            tm.distance_to_leading_vehicle(bg_veh, 3.0)
-                            spawned_ambient += 1
+        spawned_ambient = spawn_intersection_traffic(
+            world,
+            tm,
+            bp_lib,
+            junction,
+            actor_list,
+            ads_spawn_wp.transform.location,
+            max_vehicles=TRAFFIC_DENSITY,
+        )
 
         print(f"[INFO] Spawned ADS and {spawned_ambient} background conflict vehicles.")
 
@@ -178,6 +257,13 @@ def main(args):
         total_ticks = int(RECORD_SECONDS / FIXED_DELTA_T)
         print(f"[INFO] Running Intersection Behavioral Test for {RECORD_SECONDS} seconds…")
 
+        light_switched = False
+
+        if traffic_light:
+            traffic_light.set_state(carla.TrafficLightState.Red)
+            traffic_light.freeze(True)
+            print("[INFO] Traffic light initialized to RED")
+
         for tick_i in range(total_ticks):
             world.tick()
             
@@ -186,16 +272,21 @@ def main(args):
             ads_vel = ads.get_velocity()
             ads_speed_kmh = 3.6 * math.sqrt(ads_vel.x**2 + ads_vel.y**2 + ads_vel.z**2)
             
-            # Check light state affecting ADS natively
-            if ads.is_at_traffic_light():
-                traffic_light = ads.get_traffic_light()
-                state = traffic_light.get_state()
+            if traffic_light and not light_switched and t >= 2.0:
+                traffic_light.freeze(False)
+                traffic_light.set_state(carla.TrafficLightState.Green)
+                traffic_light.freeze(True)
+                light_switched = True
+                print("[INFO] Traffic light switched to GREEN")
+
+            if traffic_light:
+                traffic_light_state = traffic_light.get_state()
             else:
-                state = "No Light Detected"
+                traffic_light_state = "No Light Detected"
 
             # Log system state every second
             if tick_i % int(1.0 / FIXED_DELTA_T) == 0:
-                print(f"  t={t:5.1f}s | ADS Speed: {ads_speed_kmh:4.1f} km/h | Light State: {state} | Dist to Intersection: {dist2d(ads_loc, junction_centre):.1f}m")
+                print(f"  t={t:5.1f}s | ADS Speed: {ads_speed_kmh:4.1f} km/h | Light State: {traffic_light_state} | Dist to Intersection: {dist2d(ads_loc, junction_centre):.1f}m")
 
         # ── Encode Output ─────────────────────────────────────────────────────
         if frames:

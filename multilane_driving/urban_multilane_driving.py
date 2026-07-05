@@ -18,6 +18,7 @@ import argparse
 import math
 import random
 
+import carla
 import numpy as np
 from PIL import Image
 
@@ -28,7 +29,7 @@ GIF_FPS           = 20
 RECORD_SECONDS    = 12.0          # Time window to witness multilane interactions
 
 ADS_TARGET_SPEED_KMH = 50.0       # Enforced cruising speed for the ADS
-TRAFFIC_DENSITY   = 12            # Number of surrounding background vehicles
+TRAFFIC_DENSITY   = 100           # Number of surrounding background vehicles
 
 IMG_W, IMG_H      = 1280, 720
 CAMERA_FOV        = 95
@@ -46,9 +47,118 @@ def dist2d(a, b):
     return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
 
 
+def pick_multilane_spawn(world_map, spawn_points):
+    """Choose a straight, multi-lane road segment for the ADS spawn."""
+    best_point = None
+    best_score = -1.0
+
+    for sp in spawn_points:
+        wp = world_map.get_waypoint(sp.location)
+        if not wp:
+            continue
+
+        next_wps = wp.next(35.0)
+        if not next_wps:
+            continue
+
+        forward = wp.transform.get_forward_vector()
+        right = carla.Vector3D(x=-forward.y, y=forward.x, z=0.0)
+
+        lane_count = 1
+        left_wp = wp.get_left_lane()
+        while left_wp and lane_count < 6:
+            lane_count += 1
+            left_wp = left_wp.get_left_lane()
+
+        right_wp = wp.get_right_lane()
+        while right_wp and lane_count < 6:
+            lane_count += 1
+            right_wp = right_wp.get_right_lane()
+
+        score = lane_count * 4.0
+        if not next_wps[0].is_junction:
+            score += 6.0
+        if wp.lane_id != 0:
+            score -= 2.0
+        if wp.road_id % 2 == 0:
+            score += 1.0
+
+        if score > best_score:
+            best_score = score
+            best_point = sp
+
+    return best_point if best_point else spawn_points[0]
+
+
+def spawn_surrounding_traffic(world, tm, bp_lib, actor_list, reference_wp, target_count):
+    """Spawn vehicles on the main corridor and nearby connecting roads."""
+    spawned = 0
+    candidate_wps = []
+
+    for dist in [15.0, 30.0, 45.0, 60.0, 80.0, 100.0]:
+        next_wps = reference_wp.next(dist)
+        if next_wps:
+            candidate_wps.append(next_wps[0])
+
+    for wp in candidate_wps:
+        if spawned >= target_count:
+            break
+
+        for lane_offset in [-3.5, 0.0, 3.5]:
+            if spawned >= target_count:
+                break
+
+            candidate_tf = wp.transform
+            forward = wp.transform.get_forward_vector()
+            right = carla.Vector3D(x=-forward.y, y=forward.x, z=0.0)
+            candidate_tf.location.x += right.x * lane_offset
+            candidate_tf.location.y += right.y * lane_offset
+            candidate_tf.location.z += 0.3
+
+            bg_bp = random.choice(bp_lib.filter("vehicle.*.*"))
+            if bg_bp.get_attribute("number_of_wheels").as_int() != 4:
+                continue
+
+            bg_veh = world.try_spawn_actor(bg_bp, candidate_tf)
+            if bg_veh:
+                actor_list.append(bg_veh)
+                bg_veh.set_simulate_physics(True)
+                bg_veh.set_autopilot(True, tm.get_port())
+                tm.set_desired_speed(bg_veh, random.uniform(28.0, 45.0))
+                tm.auto_lane_change(bg_veh, True)
+                spawned += 1
+
+    # Add a few vehicles on nearby side roads by sampling junction-connected waypoints.
+    if spawned < target_count:
+        for _ in range(20):
+            if spawned >= target_count:
+                break
+
+            sample_wp = random.choice(candidate_wps) if candidate_wps else reference_wp
+            side_wps = sample_wp.get_junction().get_waypoints(carla.LaneType.Driving) if sample_wp.get_junction() else []
+            if not side_wps:
+                continue
+
+            side_wp = random.choice(side_wps)[0]
+            side_tf = side_wp.transform
+            side_tf.location.z += 0.3
+            bg_bp = random.choice(bp_lib.filter("vehicle.*.*"))
+            if bg_bp.get_attribute("number_of_wheels").as_int() != 4:
+                continue
+
+            bg_veh = world.try_spawn_actor(bg_bp, side_tf)
+            if bg_veh:
+                actor_list.append(bg_veh)
+                bg_veh.set_simulate_physics(True)
+                bg_veh.set_autopilot(True, tm.get_port())
+                tm.set_desired_speed(bg_veh, random.uniform(20.0, 35.0))
+                spawned += 1
+
+    return spawned
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 def main(args):
-    import carla
 
     random.seed(SEED)
     np.random.seed(SEED)
@@ -80,8 +190,7 @@ def main(args):
         spawn_points = world_map.get_spawn_points()
 
         # ── Pick a Multi-Lane Stretch ─────────────────────────────────────────
-        # In Town10, spawn point 0 lies on a wide, continuous multi-lane straight section
-        ads_spawn_point = spawn_points[0]
+        ads_spawn_point = pick_multilane_spawn(world_map, spawn_points)
         
         # ── Spawn ADS Vehicle ─────────────────────────────────────────────────
         ads_bp = bp_lib.filter("vehicle.tesla.model3")[0]
@@ -102,34 +211,15 @@ def main(args):
         print(f"[INFO] ADS spawned at {ads_spawn_point.location}. Target speed: {ADS_TARGET_SPEED_KMH} km/h")
 
         # ── Populate Busy Multi-lane Traffic ──────────────────────────────────
-        # Gather spawn locations nearby but across multiple lanes to create a busy environment
-        ambient_count = 0
-        shuffled_spawns = list(spawn_points)
-        random.shuffle(shuffled_spawns)
-
-        for sp in shuffled_spawns:
-            if ambient_count >= TRAFFIC_DENSITY:
-                break
-                
-            # Filter positions to be within a 150-meter radius of our ADS path to group traffic close together
-            d = dist2d(sp.location, ads_spawn_point.location)
-            if 10.0 < d < 150.0:
-                bg_bp = random.choice(bp_lib.filter("vehicle.*.*"))
-                
-                # Exclude 2-wheelers for trajectory consistency across urban lanes
-                if bg_bp.get_attribute("number_of_wheels").as_int() == 4:
-                    bg_veh = world.try_spawn_actor(bg_bp, sp)
-                    if bg_veh:
-                        actor_list.append(bg_veh)
-                        bg_veh.set_simulate_physics(True)
-                        bg_veh.set_autopilot(True, tm.get_port())
-                        
-                        # Randomize surrounding speeds slightly to create traffic bottlenecks/passing opportunities
-                        bg_speed = random.uniform(30.0, 45.0)
-                        tm.set_desired_speed(bg_veh, bg_speed)
-                        # Let them change lanes dynamically to add realism
-                        tm.auto_lane_change(bg_veh, True)
-                        ambient_count += 1
+        ads_wp = world_map.get_waypoint(ads_spawn_point.location)
+        ambient_count = spawn_surrounding_traffic(
+            world,
+            tm,
+            bp_lib,
+            actor_list,
+            ads_wp,
+            TRAFFIC_DENSITY,
+        )
 
         print(f"[INFO] Spawned {ambient_count} background vehicles to simulate a busy road environment.")
 
